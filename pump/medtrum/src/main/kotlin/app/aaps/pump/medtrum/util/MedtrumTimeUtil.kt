@@ -2,10 +2,11 @@ package app.aaps.pump.medtrum.util
 
 import java.time.Duration
 import java.time.Instant
+import javax.inject.Inject
 import javax.inject.Singleton
 
 @Singleton
-class MedtrumTimeUtil {
+class MedtrumTimeUtil @Inject constructor() {
 
     fun getCurrentTimePumpSeconds(): Long {
         val startInstant = Instant.parse("2014-01-01T00:00:00Z")
