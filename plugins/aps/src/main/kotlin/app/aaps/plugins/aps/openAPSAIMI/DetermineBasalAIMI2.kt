@@ -4107,6 +4107,64 @@ rT.reason.appendLine(
          //rT.reason.append("Eventual BG " + convertBG(eventualBG) + " >= " + convertBG(max_bg) + ", ")
             rT.reason.append(context.getString(R.string.reason_eventual_bg, convertBG(eventualBG), convertBG(max_bg)))
         }
+        val recentBGValues: List<Float> = getRecentBGs()
+        val safetyDecision = safetyAdjustment(
+            currentBG = bg.toFloat(),
+            predictedBG = predictedBg,
+            bgHistory = recentBGValues,
+            combinedDelta = combinedDelta.toFloat(),
+            iob = iob,
+            maxIob = maxIob.toFloat(),
+            tdd24Hrs = tdd24Hrs,
+            tddPerHour = tddPerHour,
+            tirInhypo = currentTIRLow.toFloat(),
+            targetBG = targetBg,
+            zeroBasalDurationMinutes = zeroBasalAccumulatedMinutes
+        )
+        // --- helpers ---
+        fun runtimeToMinutes(rt: Long?): Int {
+            if (rt == null) return Int.MAX_VALUE
+            // si valeurs en millisecondes
+            if (rt > 600_000L) return (rt / 60_000L).toInt()
+            // si valeurs en secondes
+            if (rt > 180L) return (rt / 60L).toInt()
+            // sinon: déjà en minutes
+            return rt.toInt()
+        }
+
+// -------- 1) sécurité hypo dure, avant tout
+        if (safetyDecision.stopBasal) {
+            return setTempBasal(0.0, 30, profile, rT, currenttemp)
+        }
+
+// -------- 2) forçage IMMEDIAT début de repas (<= 2 min), AVANT le test IOB
+        // Détection mode repas ACTIF + runtime en minutes (robuste secondes/minutes)
+        val (isMealActive, runtimeMinLabel, runtimeMinValue) = when {
+            mealTime     -> Triple(true, "meal",     runtimeToMinutes(mealruntime))
+            bfastTime    -> Triple(true, "bfast",    runtimeToMinutes(bfastruntime))
+            lunchTime    -> Triple(true, "lunch",    runtimeToMinutes(lunchruntime))
+            dinnerTime   -> Triple(true, "dinner",   runtimeToMinutes(dinnerruntime))
+            highCarbTime -> Triple(true, "highcarb", runtimeToMinutes(highCarbrunTime))
+            else         -> Triple(false, "", Int.MAX_VALUE)
+        }
+
+        if (isMealActive && runtimeMinValue in 0..30) {
+            val forced = forcedBasalmealmodes.coerceAtLeast(0.05) // anti-0
+            val alreadyForced = abs(currenttemp.rate - forced) < 0.05 && currenttemp.duration >= 25
+            if (!alreadyForced) {
+                rT.reason.append(
+                    context.getString(
+                        R.string.meal_mode_first_30,
+                        "$runtimeMinLabel($runtimeMinValue)",
+                        forced
+                    )
+                )
+                return setTempBasal(
+                    forced, 30, profile, rT, currenttemp,
+                    overrideSafetyLimits = true    // bypass du plafond IOB pour le départ repas
+                )
+            }
+        }
         if (iob_data.iob > max_iob) {
           //rT.reason.append("IOB ${round(iob_data.iob, 2)} > max_iob $max_iob")
             rT.reason.append(context.getString(R.string.reason_iob_max, round(iob_data.iob, 2), round(max_iob, 2)))
@@ -4125,22 +4183,8 @@ rT.reason.appendLine(
             }
         } else {
             var insulinReq = smbToGive.toDouble()
-            val recentBGValues: List<Float> = getRecentBGs()
-            //updateZeroBasalDuration(profile_current_basal)
 
-            val safetyDecision = safetyAdjustment(
-                currentBG = bg.toFloat(),
-                predictedBG = predictedBg,
-                bgHistory = recentBGValues,
-                combinedDelta = combinedDelta.toFloat(),
-                iob = iob,
-                maxIob = maxIob.toFloat(),
-                tdd24Hrs = tdd24Hrs,
-                tddPerHour = tddPerHour,
-                tirInhypo = currentTIRLow.toFloat(),
-                targetBG = targetBg,
-                zeroBasalDurationMinutes = zeroBasalAccumulatedMinutes
-            )
+            //updateZeroBasalDuration(profile_current_basal)
 
             insulinReq = insulinReq * safetyDecision.bolusFactor
             insulinReq = round(insulinReq, 3)
@@ -4179,11 +4223,6 @@ rT.reason.appendLine(
                 }
 
             }
-            // Helper: convertit en minutes quel que soit l’unité d’entrée (Long? -> minutes Int)
-            fun runtimeToMinutes(rt: Long?): Int {
-                if (rt == null) return Int.MAX_VALUE // "loin" de la fenêtre
-                return if (rt > 180L) (rt / 60L).toInt() else rt.toInt() // >180 ⇒ probablement secondes
-            }
 
 // Calcul du facteur d'ajustement en fonction de la glycémie (interpolation simplifiée)
             val basalAdjustmentFactor = interpolatebasal(bg)
@@ -4194,48 +4233,35 @@ rT.reason.appendLine(
 // Taux basal courant comme valeur de base
             var rate = profile_current_basal
 
-// Sécurité ultime
-            if (safetyDecision.stopBasal) {
-                return setTempBasal(0.0, 30, profile, rT, currenttemp)
-            }
 
-// Détection mode repas ACTIF + runtime en minutes (robuste secondes/minutes)
-            val (isMealActive, runtimeMinLabel, runtimeMinValue) = when {
-                mealTime     -> Triple(true, "meal",     runtimeToMinutes(mealruntime))
-                bfastTime    -> Triple(true, "bfast",    runtimeToMinutes(bfastruntime))
-                lunchTime    -> Triple(true, "lunch",    runtimeToMinutes(lunchruntime))
-                dinnerTime   -> Triple(true, "dinner",   runtimeToMinutes(dinnerruntime))
-                highCarbTime -> Triple(true, "highcarb", runtimeToMinutes(highCarbrunTime))
-                else         -> Triple(false, "", Int.MAX_VALUE)
-            }
 
 // ---------- FORÇAGE IMMEDIAT A L’ACTIVATION (30 minutes pleines) ----------
-            if (isMealActive) {
-                val forced = forcedBasalmealmodes.toDouble().coerceAtLeast(0.0)
-
-                // Garde anti "glissement" : si une TBR identique est déjà posée (±0.05 U/h) avec >=25 min restantes, ne pas reposer
-                val isAlreadyForced = kotlin.math.abs(currenttemp.rate - forced) < 0.05 && currenttemp.duration >= 25
-
-                // On déclenche au démarrage du mode (runtime ≤ 2 minutes) ET si pas déjà forcé
-                if (!isAlreadyForced) {
-                    rT.reason.append(
-                        context.getString(
-                            R.string.meal_mode_first_30,
-                            "$runtimeMinLabel($runtimeMinValue)",
-                            forced
-                        )
-                    )
-                    return setTempBasal(
-                        _rate = forced,
-                        duration = 30,                 // ← 30 minutes pleines à partir de maintenant
-                        profile = profile,
-                        rT = rT,
-                        currenttemp = currenttemp,
-                        overrideSafetyLimits = true,
-                        forceExact = true              // ← ignore clamps/adjust/cycle (sauf LGS)
-                    )
-                }
-            }
+//             if (isMealActive) {
+//                 val forced = forcedBasalmealmodes.toDouble().coerceAtLeast(0.0)
+//
+//                 // Garde anti "glissement" : si une TBR identique est déjà posée (±0.05 U/h) avec >=25 min restantes, ne pas reposer
+//                 val isAlreadyForced = kotlin.math.abs(currenttemp.rate - forced) < 0.05 && currenttemp.duration >= 25
+//
+//                 // On déclenche au démarrage du mode (runtime ≤ 2 minutes) ET si pas déjà forcé
+//                 if (!isAlreadyForced) {
+//                     rT.reason.append(
+//                         context.getString(
+//                             R.string.meal_mode_first_30,
+//                             "$runtimeMinLabel($runtimeMinValue)",
+//                             forced
+//                         )
+//                     )
+//                     return setTempBasal(
+//                         _rate = forced,
+//                         duration = 30,                 // ← 30 minutes pleines à partir de maintenant
+//                         profile = profile,
+//                         rT = rT,
+//                         currenttemp = currenttemp,
+//                         overrideSafetyLimits = true,
+//                         forceExact = true              // ← ignore clamps/adjust/cycle (sauf LGS)
+//                     )
+//                 }
+//             }
 // ---------------------------------------------------------------------------
 
 // 1️⃣ Préparation des variables
@@ -4271,7 +4297,7 @@ rT.reason.appendLine(
 
 // ------------------------------
 // 2️⃣ Early‐meal detection → bypass sécurité, forçage vers `forcedBasal`
-            if (detectMealOnset(delta, predicted.toFloat(), bgAcceleration.toFloat())
+            if (detectMealOnset(delta, predictedBg, bgAcceleration.toFloat())
                 && !nightbis && modesCondition && bg > 100 && autodrive
             ) {
                 chosenRate = forcedBasal.toDouble()
